@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import messagebox
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 import random
@@ -11,6 +11,15 @@ from app.db import get_connection
 
 from app.questions import load_questions
 from app.utils import compute_age_group
+
+import nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+
+# Ensure VADER lexicon is downloaded
+try:
+    nltk.data.find('sentiment/vader_lexicon.zip')
+except LookupError:
+    nltk.download('vader_lexicon')
 
 # ---------------- SETTINGS ----------------
 SETTINGS_FILE = "settings.json"
@@ -107,12 +116,15 @@ conn.commit()
 # ---------------- LOAD QUESTIONS FROM DB ----------------
 try:
     rows = load_questions()  # [(id, text)]
-    all_questions = [q[1] for q in rows]   # preserve text only
-    
-    if not all_questions:
+    all_questions_data = [
+        {'id': q[0], 'text': q[1], 'tooltip': q[2], 'type': q[3]} 
+        for q in rows
+    ]
+
+    if not all_questions_data:
         raise RuntimeError("Question bank empty")
 
-    logging.info("Loaded %s total questions from DB", len(all_questions))
+    logging.info("Loaded %s total questions from DB", len(all_questions_data))
 
 except Exception:
     logging.critical("Failed to load questions from DB", exc_info=True)
@@ -125,6 +137,9 @@ class SoulSenseApp:
         self.root = root
         self.root.title("Soul Sense EQ Test")
         self.root.geometry("650x550")  # Increased size for benchmarking
+
+        # Initialize Sentiment Analyzer
+        self.sia = SentimentIntensityAnalyzer()
         
         # Load settings
         self.settings = load_settings()
@@ -199,7 +214,26 @@ class SoulSenseApp:
         
         # Load questions based on settings
         question_count = self.settings.get("question_count", 10)
-        self.questions = all_questions[:min(question_count, len(all_questions))]
+        # Separate Text (Open-Ended) and Scale questions
+        text_questions = [q for q in all_questions_data if q['type'] == 'text']
+        scale_questions = [q for q in all_questions_data if q['type'] == 'scale']
+
+        # Ensure we include at least 2 text questions if available
+        selected_questions = []
+        if text_questions:
+            # 1. Calculate how many scale questions we need
+            num_text = min(2, len(text_questions))
+            num_scale = question_count - num_text
+            
+            # 2. Add Scale questions FIRST
+            selected_questions.extend(scale_questions[:num_scale])
+            
+            # 3. Add Text questions LAST
+            selected_questions.extend(text_questions[:num_text])
+        else:
+            selected_questions = all_questions_data[:question_count]
+
+        self.questions = selected_questions
         logging.info("Using %s questions based on settings", len(self.questions))
         
         self.create_welcome_screen()
@@ -444,7 +478,7 @@ class SoulSenseApp:
         qcount_spin = tk.Spinbox(
             qcount_frame,
             from_=5,
-            to=min(50, len(all_questions)),
+            to=min(50, len(all_questions_data)),
             textvariable=self.qcount_var,
             font=("Arial", 12),
             width=10,
@@ -720,38 +754,59 @@ class SoulSenseApp:
         self.create_widget(
             tk.Label,
             q_frame,
-            text=f"Q{self.current_question + 1}: {q}",
+            text=f"Q{self.current_question + 1}: {q['text']}",
             wraplength=400,
             font=("Arial", 12)
         ).pack(side="left")
         
-        # Tooltip Icon
-        info_btn = tk.Button(
-            q_frame,
-            text="ℹ️",
-            font=("Arial", 12),
-            bg=self.colors["bg"],
-            fg=self.colors["fg"],
-            relief="flat",
-            command=lambda: None # Placeholder, real action via bind
-        )
-        info_btn.pack(side="left", padx=5)
-        info_btn.bind("<Button-1>", lambda e: self.toggle_tooltip(e, "Select the option that best describes you.\nThere are no right or wrong answers."))
-        info_btn.bind("<Return>", lambda e: self.toggle_tooltip(e, "Select the option that best describes you.\nThere are no right or wrong answers."))
+        # Tooltip handling
+        if q['tooltip']:
+            info_btn = tk.Button(
+                q_frame,
+                text="ℹ️",
+                font=("Arial", 12),
+                bg=self.colors["bg"],
+                fg=self.colors["fg"],
+                relief="flat"
+            )
+            info_btn.pack(side="left", padx=5)
+            info_btn.bind("<Button-1>", lambda e: self.toggle_tooltip(e, q['tooltip']))
 
-        # Bind Enter to Next
-        self.root.bind("<Return>", lambda e: self.save_answer())
-
-        self.answer_var = tk.IntVar()
-
-        for val, txt in enumerate(["Never", "Sometimes", "Often", "Always"], 1):
+        # --- DYNAMIC UI SWITCHING BASED ON TYPE ---
+        self.current_q_type = q.get('type', 'scale') # Default to scale
+        
+        if self.current_q_type == 'text':
+            # === OPEN ENDED UI ===
             self.create_widget(
-                tk.Radiobutton,
+                tk.Label,
                 self.root,
-                text=f"{txt} ({val})",
-                variable=self.answer_var,
-                value=val
-            ).pack(anchor="w", padx=50)
+                text="Type your answer below (be honest and expressive):",
+                font=("Arial", 10, "italic")
+            ).pack(pady=(0, 5))
+
+            self.text_entry = tk.Text(
+                self.root,
+                height=5,
+                width=50,
+                font=("Arial", 11),
+                bg=self.colors["entry_bg"],
+                fg=self.colors["entry_fg"],
+                insertbackground=self.colors["fg"]
+            )
+            self.text_entry.pack(pady=10)
+            self.text_entry.focus_set()
+            
+        else:
+            # === SCALE UI (Existing) ===
+            self.answer_var = tk.IntVar()
+            for val, txt in enumerate(["Never", "Sometimes", "Often", "Always"], 1):
+                self.create_widget(
+                    tk.Radiobutton,
+                    self.root,
+                    text=f"{txt} ({val})",
+                    variable=self.answer_var,
+                    value=val
+                ).pack(anchor="w", padx=150) # Centered slightly better
 
         # Navigation buttons
         button_frame = self.create_widget(tk.Frame, self.root)
@@ -780,31 +835,71 @@ class SoulSenseApp:
             self.show_question()
 
     def save_answer(self):
-        ans = self.answer_var.get()
-        if ans == 0:
-            messagebox.showwarning("Input Error", "Please select an answer.")
-            return
+        q_data = self.questions[self.current_question]
+        
+        # --- LOGIC FOR SAVING ANSWERS ---
+        if self.current_q_type == 'text':
+            # Handle Text Response
+            text_response = self.text_entry.get("1.0", tk.END).strip()
+            if not text_response:
+                messagebox.showwarning("Input Error", "Please write something.")
+                return
+            
+            # 1. Calculate Sentiment
+            sentiment = self.sia.polarity_scores(text_response)
+            compound_score = sentiment['compound'] # -1.0 to 1.0
+            
+            # 2. Convert Sentiment to "Score" (Optional mapping)
+            # Map -1..1 to 1..4 range for compatibility with total score
+            # Formula: ((compound + 1) / 2) * 3 + 1  => Maps -1->1, 1->4
+            numeric_score = int(((compound_score + 1) / 2) * 3 + 1)
+            
+            self.responses.append(numeric_score) # Add to running total
+            
+            # Save to DB
+            self._write_response_to_db(
+                q_id=q_data['id'],
+                val=numeric_score,
+                text=text_response,
+                sentiment=compound_score
+            )
+            
+        else:
+            # Handle Scale Response (Existing)
+            ans = self.answer_var.get()
+            if ans == 0:
+                messagebox.showwarning("Input Error", "Please select an answer.")
+                return
 
-        self.responses.append(ans)
+            self.responses.append(ans)
+            
+            self._write_response_to_db(
+                q_id=q_data['id'],
+                val=ans,
+                text=None,
+                sentiment=None
+            )
 
-        qid = self.current_question + 1
-        ts = datetime.utcnow().isoformat()
+        self.current_question += 1
+        self.show_question()
 
+    def _write_response_to_db(self, q_id, val, text, sentiment):
+        """Helper to write response to DB"""
+        ts = datetime.now(timezone.utc).isoformat()
         try:
+            # We need to use the SQLAlchemy session or raw cursor. 
+            # Since main.py uses raw cursor mostly:
             cursor.execute(
                 """
                 INSERT INTO responses
-                (username, question_id, response_value, age_group, timestamp)
-                VALUES (?, ?, ?, ?, ?)
+                (username, question_id, response_value, response_text, sentiment_score, age_group, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (self.username, qid, ans, self.age_group, ts)
+                (self.username, q_id, val, text, sentiment, self.age_group, ts)
             )
             conn.commit()
         except Exception:
             logging.error("Failed to store response", exc_info=True)
-
-        self.current_question += 1
-        self.show_question()
 
     def finish_test(self):
         self.current_score = sum(self.responses)
@@ -814,7 +909,7 @@ class SoulSenseApp:
         try:
             cursor.execute(
                 "INSERT INTO scores (username, age, total_score, timestamp) VALUES (?, ?, ?, ?)",
-                (self.username, self.age, self.current_score, datetime.utcnow().isoformat())
+                (self.username, self.age, self.current_score, datetime.now(timezone.utc).isoformat())
             )
             conn.commit()
         except Exception:
@@ -1246,6 +1341,77 @@ class SoulSenseApp:
             cat_canvas.create_rectangle(0, 0, cat_fill_width, 15, fill=cat_color, outline="")
             cat_canvas.create_text(100, 7, text=f"{cat_score:.0f}%", fill="white" if cat_score > 50 else "black", font=("Arial", 8))
         
+        # --- NEW: SENTIMENT ANALYSIS REPORT ---
+        # Fetch open-ended responses from the current session
+        
+        # Check if there are any text responses for this user in the current session
+        # We can look at self.responses and self.questions to find text types
+        text_responses_data = []
+        
+        # We need to query the DB to get the actual text and scores we just saved
+        cursor.execute("""
+            SELECT question_bank.question_text, responses.response_text, responses.sentiment_score, responses.response_value
+            FROM responses
+            JOIN question_bank ON responses.question_id = question_bank.id
+            WHERE responses.username = ? 
+            AND responses.response_text IS NOT NULL
+            ORDER BY responses.id DESC
+            LIMIT 2
+        """, (self.username,))
+        
+        sentiment_rows = cursor.fetchall()
+
+        if sentiment_rows:
+            sentiment_frame = self.create_widget(tk.Frame, scrollable_frame)
+            sentiment_frame.pack(fill="x", pady=20, padx=20)
+            
+            self.create_widget(
+                tk.Label,
+                sentiment_frame,
+                text="🤖 AI Sentiment Analysis",
+                font=("Arial", 14, "bold")
+            ).pack(anchor="w", pady=10)
+            
+            for q_text, r_text, s_score, s_val in sentiment_rows:
+                item_frame = self.create_widget(tk.Frame, sentiment_frame, relief="groove", borderwidth=1)
+                item_frame.pack(fill="x", pady=5, ipadx=10, ipady=5)
+                
+                # Question
+                self.create_widget(
+                    tk.Label,
+                    item_frame,
+                    text=f"Q: {q_text}",
+                    font=("Arial", 10, "bold"),
+                    anchor="w"
+                ).pack(fill="x")
+                
+                # User's Answer
+                self.create_widget(
+                    tk.Label,
+                    item_frame,
+                    text=f"Your Answer: \"{r_text}\"",
+                    font=("Arial", 10, "italic"),
+                    anchor="w",
+                    fg="#555555" if self.current_theme == "light" else "#aaaaaa"
+                ).pack(fill="x")
+                
+                # Analysis Result
+                # Determine color based on score
+                score_color = self.colors["improvement_good"] if s_score > 0.5 else \
+                              self.colors["improvement_bad"] if s_score < -0.5 else \
+                              self.colors["improvement_neutral"]
+                
+                stats_text = f"Sentiment: {s_score:.4f}  ➔  EQ Points Awarded: {s_val}/4"
+                
+                self.create_widget(
+                    tk.Label,
+                    item_frame,
+                    text=stats_text,
+                    font=("Arial", 10, "bold"),
+                    fg=score_color,
+                    anchor="w"
+                ).pack(fill="x", pady=(5,0))
+
         # Test summary
         summary_text_frame = self.create_widget(tk.Frame, scrollable_frame)
         summary_text_frame.pack(fill="x", pady=20, padx=20)

@@ -21,3 +21,6 @@ sqlalchemy>=2.0
 alembic>=1.13
 
 # Python 3.6+ recommended
+
+#For sentiment analysis
+nltk>=3.8.1

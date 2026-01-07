@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, Text, Float, DateTime, ForeignKey, Boolean, Index, func, event
 from sqlalchemy.orm import declarative_base, relationship
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 Base = declarative_base()
@@ -12,7 +12,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String, unique=True, nullable=False, index=True)  # Added index
     password_hash = Column(String, nullable=False)
-    created_at = Column(String, default=lambda: datetime.utcnow().isoformat(), index=True)  # Added index
+    created_at = Column(String, default=lambda: datetime.now(timezone.utc).isoformat(), index=True)  # Added index
     last_login = Column(String, nullable=True, index=True)  # Added index
 
     # Relationships
@@ -33,7 +33,7 @@ class Score(Base):
     age = Column(Integer, index=True)  # Added index
     detailed_age_group = Column(String, index=True)  # Added index
     user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)  # Added index
-    timestamp = Column(String, default=lambda: datetime.utcnow().isoformat(), index=True)  # Added timestamp and index
+    timestamp = Column(String, default=lambda: datetime.now(timezone.utc).isoformat(), index=True)  # Added timestamp and index
 
     user = relationship("User", back_populates="scores")
 
@@ -52,9 +52,11 @@ class Response(Base):
     username = Column(String, index=True)  # Added index
     question_id = Column(Integer, index=True)  # Added index
     response_value = Column(Integer, index=True)  # Added index
+    response_text = Column(Text, nullable=True)   # Stores the open-ended answer
+    sentiment_score = Column(Float, nullable=True) # Stores the NLTK compound score (-1.0 to 1.0)
     age_group = Column(String, index=True)  # Added index
     detailed_age_group = Column(String, index=True)  # Added index
-    timestamp = Column(String, default=lambda: datetime.utcnow().isoformat(), index=True)  # Added index
+    timestamp = Column(String, default=lambda: datetime.now(timezone.utc).isoformat(), index=True)  # Added index
     user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)  # Added index
 
     user = relationship("User", back_populates="responses")
@@ -85,6 +87,7 @@ class Question(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     question_text = Column(Text, nullable=False)
+    response_type = Column(String, default="scale", nullable=False)
     category_id = Column(Integer, default=0, index=True)  # Added index
     difficulty = Column(Integer, default=1, index=True)  # Added index
     min_age = Column(Integer, default=0)
@@ -92,7 +95,7 @@ class Question(Base):
     weight = Column(Float, default=1.0)
     is_active = Column(Integer, default=1, index=True)  # Added index
     tooltip = Column(Text, nullable=True)
-    created_at = Column(String, default=lambda: datetime.utcnow().isoformat(), index=True)  # Added index
+    created_at = Column(String, default=lambda: datetime.now(timezone.utc).isoformat(), index=True)  # Added index
 
     # Composite indexes for optimized querying
     __table_args__ = (
@@ -203,7 +206,7 @@ class QuestionCache(Base):
     category_id = Column(Integer, index=True)
     difficulty = Column(Integer, index=True)
     is_active = Column(Integer, default=1, index=True)
-    cached_at = Column(String, default=lambda: datetime.utcnow().isoformat())
+    cached_at = Column(String, default=lambda: datetime.now(timezone.utc).isoformat())
     access_count = Column(Integer, default=0, index=True)
     
     __table_args__ = (
@@ -220,7 +223,7 @@ class StatisticsCache(Base):
     stat_name = Column(String, unique=True, index=True)  # e.g., 'avg_score_global', 'question_count'
     stat_value = Column(Float)
     stat_json = Column(Text)  # For complex statistics
-    calculated_at = Column(String, default=lambda: datetime.utcnow().isoformat())
+    calculated_at = Column(String, default=lambda: datetime.now(timezone.utc).isoformat())
     valid_until = Column(String, index=True)
     
     __table_args__ = (
@@ -279,10 +282,10 @@ def preload_frequent_data(session):
         ).scalar() or 0
         
         stats = [
-            ('avg_score_global', avg_score, datetime.utcnow().isoformat()),
-            ('question_count', question_count, datetime.utcnow().isoformat()),
+            ('avg_score_global', avg_score, datetime.now(timezone.utc).isoformat()),
+            ('question_count', question_count, datetime.now(timezone.utc).isoformat()),
             ('active_users', session.query(func.count(User.id)).scalar() or 0, 
-             datetime.utcnow().isoformat())
+             datetime.now(timezone.utc).isoformat())
         ]
         
         for stat_name, stat_value, calculated_at in stats:

@@ -43,7 +43,7 @@ def _is_cache_valid(cache_key: str) -> bool:
     cache_time = _cache_timestamps[cache_key]
     return (time.time() - cache_time) < MEMORY_CACHE_TTL
 
-def _save_to_disk_cache(questions: List[Tuple[int, str, Optional[str]]], age: Optional[int] = None):
+def _save_to_disk_cache(questions: List[Tuple[int, str, Optional[str], str]], age: Optional[int] = None):
     """Save questions to disk cache file"""
     try:
         _ensure_cache_dir()
@@ -86,15 +86,24 @@ def _load_from_disk_cache(age: Optional[int] = None):
         if cache_data.get("age_filter") != age:
             return None
         
-        questions = [(int(q[0]), q[1], q[2]) for q in cache_data["questions"]]
+        # --- FIXED: Handle Legacy Cache (3 items) vs New (4 items) ---
+        questions = []
+        for q in cache_data["questions"]:
+            if len(q) >= 4:
+                questions.append((int(q[0]), q[1], q[2], q[3]))
+            else:
+                # Fallback for old cache files: Default to 'scale'
+                questions.append((int(q[0]), q[1], q[2], 'scale'))
+        # -------------------------------------------------------------
+
         logger.debug(f"Loaded {len(questions)} questions from disk cache (age filter: {age})")
         return questions
     except Exception as e:
         logger.error(f"Failed to load disk cache: {e}")
         return None
 
-@lru_cache(maxsize=8)  # Cache for different age filters
-def _get_cached_questions_from_db(age: Optional[int] = None) -> List[Tuple[int, str, Optional[str]]]:
+@lru_cache(maxsize=8)
+def _get_cached_questions_from_db(age: Optional[int] = None) -> List[Tuple[int, str, Optional[str], str]]:
     """Get questions from database with LRU caching"""
     session = get_session()
     try:
@@ -103,15 +112,16 @@ def _get_cached_questions_from_db(age: Optional[int] = None) -> List[Tuple[int, 
         if age is not None:
             query = query.filter(Question.min_age <= age, Question.max_age >= age)
             
-        # Use optimized query with only needed columns
+        # --- UPDATED QUERY with response_type ---
         questions = query.with_entities(
             Question.id, 
             Question.question_text, 
-            Question.tooltip
+            Question.tooltip,
+            Question.response_type
         ).order_by(Question.id).all()
         
-        # Convert to list of tuples
-        rows = [(q.id, q.question_text, q.tooltip) for q in questions]
+        rows = [(q.id, q.question_text, q.tooltip, q.response_type) for q in questions]
+        # ----------------------------------------
         
         if not rows:
             raise RuntimeError("No questions found in database")
@@ -121,16 +131,11 @@ def _get_cached_questions_from_db(age: Optional[int] = None) -> List[Tuple[int, 
     finally:
         session.close()
 
-def _try_database_cache(session: Session, age: Optional[int] = None) -> List[Tuple[int, str, Optional[str]]]:
+def _try_database_cache(session: Session, age: Optional[int] = None) -> List[Tuple[int, str, Optional[str], str]]:
     """Try to get questions from database cache table first"""
     try:
         query = session.query(QuestionCache).filter(QuestionCache.is_active == 1)
         
-        if age is not None:
-            # Note: QuestionCache doesn't have age filters, so we'll use it for all questions
-            # and filter in memory if needed
-            pass
-            
         cached = query.order_by(QuestionCache.question_id).all()
         
         if cached:
@@ -146,14 +151,11 @@ def _try_database_cache(session: Session, age: Optional[int] = None) -> List[Tup
             
             threading.Thread(target=update_access_counts, daemon=True).start()
             
-            result = [(c.question_id, c.question_text, None) for c in cached]
+            # --- FIXED: Return 4-tuple with default 'scale' type ---
+            # The QuestionCache table doesn't have response_type yet, so we default to 'scale'
+            result = [(c.question_id, c.question_text, None, 'scale') for c in cached]
+            # -----------------------------------------------------
             
-            # Apply age filter if needed (in memory)
-            if age is not None:
-                # We don't have age info in cache, so return all and let caller filter
-                # For now, return all and main function will handle filtering
-                pass
-                
             logger.debug(f"Loaded {len(result)} questions from DB cache")
             return result
     except Exception as e:
@@ -201,23 +203,13 @@ def _warmup_cache():
 
 def load_questions(
     age: Optional[int] = None,
-    db_path: Optional[str] = None  # Kept for backward compatibility
-) -> List[Tuple[int, str, Optional[str]]]:
+    db_path: Optional[str] = None
+) -> List[Tuple[int, str, Optional[str], str]]:
     """
     Load questions from DB using ORM with multi-level caching.
-    Returns list of (id, question_text, tooltip) tuples.
-    
-    Performance optimizations:
-    1. Memory cache with TTL (5 minutes)
-    2. Disk cache with expiration (24 hours)
-    3. Database cache table
-    4. Background preloading
-    5. LRU caching for DB queries
-    6. Thread-safe operations
+    Returns list of (id, question_text, tooltip, type) tuples.
     """
-    # Backward compatibility: ignore db_path as we use centralized session
     if isinstance(age, str) and db_path is None:
-        # Handle old calling pattern
         try:
             age = int(age) if age else None
         except ValueError:
@@ -225,62 +217,46 @@ def load_questions(
     
     cache_key = _get_cache_key(age)
     
-    # 1. Check memory cache first (fastest)
+    # 1. Check memory cache first
     if _is_cache_valid(cache_key) and cache_key in _questions_cache:
-        logger.debug(f"Memory cache hit for {cache_key}")
-        return _questions_cache[cache_key]
+        # Verify tuple size just in case
+        cached_data = _questions_cache[cache_key]
+        if cached_data and len(cached_data[0]) == 4:
+            logger.debug(f"Memory cache hit for {cache_key}")
+            return cached_data
     
-    # 2. Check disk cache (fast)
+    # 2. Check disk cache
     with _cache_lock:
-        # Double-check memory cache after acquiring lock
-        if _is_cache_valid(cache_key) and cache_key in _questions_cache:
-            logger.debug(f"Memory cache hit (after lock) for {cache_key}")
-            return _questions_cache[cache_key]
-        
         disk_cache = _load_from_disk_cache(age)
         if disk_cache is not None:
-            # Update memory cache
             _questions_cache[cache_key] = disk_cache
             _cache_timestamps[cache_key] = time.time()
             logger.debug(f"Disk cache hit for {cache_key}")
             return disk_cache
     
-    # 3. Try database cache table
+    # 3. Try database cache table (Warning: this might return default 'scale' types)
     session = get_session()
     try:
         db_cache = _try_database_cache(session, age)
+        # Only use DB cache if we are sure it's valid, otherwise prefer main DB reload
+        # For now, let's skip DB cache fallback if we really need accurate types
+        # But to prevent crash, we return the Safe Tuple constructed in _try_database_cache
         if db_cache is not None:
-            # Update memory cache
-            with _cache_lock:
-                _questions_cache[cache_key] = db_cache
-                _cache_timestamps[cache_key] = time.time()
-            
-            # Save to disk cache in background
-            threading.Thread(
-                target=_save_to_disk_cache,
-                args=(db_cache, age),
-                daemon=True
-            ).start()
-            
-            logger.debug(f"Database cache hit for {cache_key}")
-            return db_cache
+             pass # Logic handles it in _try_database_cache
     finally:
         session.close()
     
-    # 4. Load from database (slowest)
+    # 4. Load from database (The Source of Truth)
     logger.debug(f"Cache miss for {cache_key}, loading from database...")
     start_time = time.time()
     
     try:
-        # Use LRU cached database function
         questions = _get_cached_questions_from_db(age)
         
-        # Update caches
         with _cache_lock:
             _questions_cache[cache_key] = questions
             _cache_timestamps[cache_key] = time.time()
         
-        # Save to disk cache in background
         threading.Thread(
             target=_save_to_disk_cache,
             args=(questions, age),
